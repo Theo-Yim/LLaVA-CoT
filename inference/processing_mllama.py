@@ -288,6 +288,12 @@ class MllamaProcessor(ProcessorMixin):
                 _ = text_kwargs.pop("padding_side", None)  # hack until padding-side is an accepted kwarg by tokenizers
                 encoding = self.tokenizer(text, **text_kwargs)
                 data.update(encoding)
+            elif (hasattr(text, "dim") and callable(getattr(text, "dim")) and text.dim() == 2) \
+                or (isinstance(text, np.ndarray) and text.ndim == 2):
+                encoding = {}
+                encoding["input_ids"] = text
+                data.update(encoding)
+                n_images_in_text = [(t == self.image_token_id).sum().item() for t in text]
             else:
                 encoding = {}
                 encoding["input_ids"] = text

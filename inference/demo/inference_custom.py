@@ -5,6 +5,8 @@ import numpy as np
 import copy
 import argparse
 from transformers import StoppingCriteria, StoppingCriteriaList, MllamaForConditionalGeneration, AutoProcessor, MllamaProcessor
+import cv2
+import os
 
 parser = argparse.ArgumentParser(description="LLaVA-CoT Simple Inference")
 parser.add_argument(
@@ -21,7 +23,13 @@ parser.add_argument(
 parser.add_argument(
     "--image_path",
     type=str,
-    help="Path to the image.",
+    help="Path to the image (for single image - backward compatibility).",
+)
+parser.add_argument(
+    "--media_paths",
+    type=str,
+    nargs='+',
+    help="Paths to images or videos (for multiple media).",
 )
 parser.add_argument(
     "--type",
@@ -41,6 +49,12 @@ parser.add_argument(
     type=str,
     default="cuda",
     help="Device to use for inference.",
+)
+parser.add_argument(
+    "--max_frames",
+    type=int,
+    default=8,
+    help="Maximum number of frames to extract from video.",
 )
 args = parser.parse_args()
 
@@ -76,6 +90,61 @@ model = MllamaForConditionalGeneration.from_pretrained(
 device = args.device
 processor: MllamaProcessor = AutoProcessor.from_pretrained(model_name_or_path, cache_dir="./checkpoints")
 kwargs = dict(do_sample=True, max_new_tokens=2048, temperature=0.6, top_p=0.9)
+
+def extract_frames_from_video(video_path, max_frames=8):
+    """Extract frames from video file."""
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    if total_frames <= max_frames:
+        frame_indices = list(range(total_frames))
+    else:
+        frame_indices = np.linspace(0, total_frames - 1, max_frames, dtype=int)
+    
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(frame_rgb)
+            frames.append(pil_image)
+    
+    cap.release()
+    return frames
+
+def load_media(media_paths, max_frames=8):
+    """Load images or extract frames from videos."""
+    all_images = []
+
+    media_paths_sorted = list()
+    for path in media_paths:
+        if os.path.isdir(path):
+            for pp in os.listdir(path):
+                media_paths_sorted.append(os.path.join(path, pp))
+        else:
+            media_paths_sorted.append(path)
+    media_paths_sorted.sort(reverse=True)
+    
+    for path in media_paths_sorted:
+        if not os.path.exists(path):
+            print(f"Warning: {path} does not exist, skipping...")
+            continue
+            
+        video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm']
+        if any(path.lower().endswith(ext) for ext in video_extensions):
+            frames = extract_frames_from_video(path, max_frames)
+            all_images.extend(frames)
+        else:
+            try:
+                image = Image.open(path).convert("RGB")
+                all_images.append(image)
+            except Exception as e:
+                print(f"Error loading {path}: {e}")
+                continue
+    
+    return all_images
 
 def judge(image, prompt, outputs, type="summary"):
     input_outputs = []
@@ -179,12 +248,21 @@ def judge(image, prompt, outputs, type="summary"):
     judge_prompt += f' Please strictly follow the following format requirements when outputting, and don’t have any other unnecessary words.'
     judge_prompt += f'\n\nOutput format: "Since [reason], I choose response [1/2]."'
     
-    judge_message = [
-        {'role': 'user', 'content': [
-            {'type': 'image'},
-            {'type': 'text', 'text': judge_prompt}
-        ]}
-    ]
+    # Handle both single image and multiple images
+    if isinstance(image, list):
+        content = []
+        for img in image:
+            content.append({'type': 'image'})
+        content.append({'type': 'text', 'text': judge_prompt})
+        judge_message = [{'role': 'user', 'content': content}]
+    else:
+        judge_message = [
+            {'role': 'user', 'content': [
+                {'type': 'image'},
+                {'type': 'text', 'text': judge_prompt}
+            ]}
+        ]
+    
     judge_input_text = processor.apply_chat_template(judge_message, add_generation_prompt=True)
     judge_inputs = processor(image, judge_input_text, return_tensors='pt').to(device)
     judge_output = model.generate(**judge_inputs, **kwargs)
@@ -196,15 +274,28 @@ def judge(image, prompt, outputs, type="summary"):
         return 1
         
 def generate_inner_best_of_N(prompt, image_path, beam_size=2):
+    # Handle both single image path and list of images
+    if isinstance(image_path, str):
+        image = Image.open(image_path)
+    else:
+        image = image_path  # Already a list of PIL Images
 
-    image = Image.open(image_path)
-    messages = [
-        {'role': 'user', 'content': [
-            {'type': 'image'},
-            {'type': 'text', 'text': prompt}
-        ]}
-    ]
-    input_text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    # Create message content
+    if isinstance(image, list):
+        content = []
+        for img in image:
+            content.append({'type': 'image'})
+        content.append({'type': 'text', 'text': prompt})
+        messages = [{'role': 'user', 'content': content}]
+    else:
+        messages = [
+            {'role': 'user', 'content': [
+                {'type': 'image'},
+                {'type': 'text', 'text': prompt}
+            ]}
+        ]
+    
+    input_text = processor.apply_chat_template(messages, add_generation_prompt=True)
     inputs = processor(image, input_text, return_tensors='pt').to(device)
     
     initial_length = len(inputs['input_ids'][0])
@@ -247,15 +338,28 @@ def generate_inner_best_of_N(prompt, image_path, beam_size=2):
     return final_output
 
 def generate_inner_sentence_beam(prompt, image_path, beam_size=2):
+    # Handle both single image path and list of images
+    if isinstance(image_path, str):
+        image = Image.open(image_path)
+    else:
+        image = image_path  # Already a list of PIL Images
     
-    image = Image.open(image_path)
-    messages = [
-        {'role': 'user', 'content': [
-            {'type': 'image'},
-            {'type': 'text', 'text': prompt}
-        ]}
-    ]
-    input_text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    # Create message content
+    if isinstance(image, list):
+        content = []
+        for img in image:
+            content.append({'type': 'image'})
+        content.append({'type': 'text', 'text': prompt})
+        messages = [{'role': 'user', 'content': content}]
+    else:
+        messages = [
+            {'role': 'user', 'content': [
+                {'type': 'image'},
+                {'type': 'text', 'text': prompt}
+            ]}
+        ]
+    
+    input_text = processor.apply_chat_template(messages, add_generation_prompt=True)
     inputs = processor(image, input_text, return_tensors='pt').to(device)
 
     initial_length = len(inputs['input_ids'][0])
@@ -300,15 +404,28 @@ def generate_inner_sentence_beam(prompt, image_path, beam_size=2):
     return final_output
 
 def generate_inner_stage_beam(prompt, image_path, beam_size=2):
+    # Handle both single image path and list of images
+    if isinstance(image_path, str):
+        image = Image.open(image_path)
+    else:
+        image = image_path  # Already a list of PIL Images
 
-    image = Image.open(image_path)
-    messages = [
-        {'role': 'user', 'content': [
-            {'type': 'image'},
-            {'type': 'text', 'text': prompt}
-        ]}
-    ]
-    input_text = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+    # Create message content
+    if isinstance(image, list):
+        content = []
+        for img in image:
+            content.append({'type': 'image'})
+        content.append({'type': 'text', 'text': prompt})
+        messages = [{'role': 'user', 'content': content}]
+    else:
+        messages = [
+            {'role': 'user', 'content': [
+                {'type': 'image'},
+                {'type': 'text', 'text': prompt}
+            ]}
+        ]
+    
+    input_text = processor.apply_chat_template(messages, add_generation_prompt=True)
     inputs = processor(image, input_text, return_tensors='pt').to(device)
     
     stages = ['<SUMMARY>', '<CAPTION>', '<REASONING>', '<CONCLUSION>']
@@ -365,4 +482,22 @@ def generate_inner(prompt, image_path, type="stage", beam_size=2):
     else:
         raise ValueError("Invalid type. Choose from 'best_of_N', 'sentence', or 'stage'.")
 
-print(generate_inner(args.prompt, args.image_path, type=args.type, beam_size=args.beam_size))
+# Main execution
+if __name__ == "__main__":
+    # Check if using multiple media or single image
+    if args.media_paths:
+        # Multiple media mode
+        images = load_media(args.media_paths, args.max_frames)
+        if not images:
+            print("No valid images or videos found!")
+            exit(1)
+        print(f"Loaded {len(images)} images from {len(args.media_paths)} media files")
+        res = generate_inner(args.prompt, images, type=args.type, beam_size=args.beam_size)
+        print(res)
+    elif args.image_path:
+        # Single image mode (backward compatibility)
+        res = generate_inner(args.prompt, args.image_path, type=args.type, beam_size=args.beam_size)
+        print(res)
+    else:
+        print("Error: Please specify either --image_path or --media_paths")
+        exit(1)
