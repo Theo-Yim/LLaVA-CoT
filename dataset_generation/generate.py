@@ -3,7 +3,7 @@ import base64
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import openai
+# import openai
 from openai import OpenAI
 import time
 import re

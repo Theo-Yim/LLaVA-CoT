@@ -1,3 +1,5 @@
 .vscode/
 checkpoints/
 samples/
+.env
+.vscode/launch.json
